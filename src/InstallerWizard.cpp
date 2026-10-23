@@ -4,6 +4,7 @@
 #include <shlobj.h>
 #include <shlwapi.h>
 #include <commctrl.h>
+#include <tlhelp32.h>
 #include <thread>
 #include <vector>
 #include <sstream>
@@ -14,6 +15,130 @@
 
 constexpr UINT WM_INSTALL_PROGRESS = WM_USER + 100;
 constexpr UINT WM_INSTALL_COMPLETE = WM_USER + 101;
+
+// 관리자 권한 프로세스 제어를 위한 SeDebugPrivilege 권한 활성화
+static bool enableDebugPrivilege() {
+    HANDLE hToken = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+        return false;
+    }
+
+    LUID luid;
+    if (!LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &luid)) {
+        CloseHandle(hToken);
+        return false;
+    }
+
+    TOKEN_PRIVILEGES tp;
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    BOOL ok = AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+    DWORD dwErr = GetLastError();
+    CloseHandle(hToken);
+    return (ok && dwErr != ERROR_NOT_ALL_ASSIGNED);
+}
+
+struct EnumCloseContext {
+    DWORD pid;
+    std::vector<HWND> hwnds;
+};
+
+static BOOL CALLBACK EnumWindowsCloseProc(HWND hWnd, LPARAM lParam) {
+    auto* ctx = reinterpret_cast<EnumCloseContext*>(lParam);
+    DWORD wndPid = 0;
+    GetWindowThreadProcessId(hWnd, &wndPid);
+    if (wndPid == ctx->pid && IsWindowVisible(hWnd)) {
+        ctx->hwnds.push_back(hWnd);
+    }
+    return TRUE;
+}
+
+// 대상 설치 폴더에서 실행 중인 대상 프로그램 프로세스(PID) 검색
+static std::vector<DWORD> findRunningProcesses(const std::wstring& targetDir, const std::wstring& mainExeName) {
+    std::vector<DWORD> pids;
+    DWORD currentPid = GetCurrentProcessId();
+
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return pids;
+
+    std::wstring normTargetDir = targetDir;
+    while (!normTargetDir.empty() && (normTargetDir.back() == L'\\' || normTargetDir.back() == L'/')) {
+        normTargetDir.pop_back();
+    }
+    for (wchar_t& c : normTargetDir) c = towlower(c);
+
+    std::wstring lowerExeName = mainExeName;
+    for (wchar_t& c : lowerExeName) c = towlower(c);
+
+    PROCESSENTRY32W pe = { sizeof(pe) };
+    if (Process32FirstW(hSnap, &pe)) {
+        do {
+            if (pe.th32ProcessID == currentPid || pe.th32ProcessID <= 4) {
+                continue;
+            }
+
+            std::wstring curExe = pe.szExeFile;
+            for (wchar_t& c : curExe) c = towlower(c);
+
+            if (curExe == lowerExeName) {
+                // 관리자 권한 프로세스도 경로를 조회할 수 있도록 PROCESS_QUERY_LIMITED_INFORMATION 사용
+                HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+                if (hProc) {
+                    wchar_t fullPath[MAX_PATH] = { 0 };
+                    DWORD size = MAX_PATH;
+                    if (QueryFullProcessImageNameW(hProc, 0, fullPath, &size)) {
+                        std::wstring lowerFullPath = fullPath;
+                        for (wchar_t& c : lowerFullPath) c = towlower(c);
+
+                        // 대상 디렉터리 내에 위치한 프로세스인지 확인
+                        if (lowerFullPath.find(normTargetDir) == 0) {
+                            pids.push_back(pe.th32ProcessID);
+                        }
+                    } else {
+                        // 권한 등으로 전체 경로 조회가 불가하더라도 동명 프로세스이면 감지 목록에 포함
+                        pids.push_back(pe.th32ProcessID);
+                    }
+                    CloseHandle(hProc);
+                } else {
+                    pids.push_back(pe.th32ProcessID);
+                }
+            }
+        } while (Process32NextW(hSnap, &pe));
+    }
+    CloseHandle(hSnap);
+    return pids;
+}
+
+// 프로세스 안전 종료 (WM_CLOSE 정상 종료 시도 후 미종료 시 TerminateProcess 강제 종료)
+static bool terminateTargetProcesses(const std::vector<DWORD>& pids) {
+    enableDebugPrivilege();
+
+    for (DWORD pid : pids) {
+        // 1. 최상위 윈도우에 WM_CLOSE 전송 (정상 종료 유도)
+        EnumCloseContext ctx = { pid, {} };
+        EnumWindows(EnumWindowsCloseProc, reinterpret_cast<LPARAM>(&ctx));
+        for (HWND hWnd : ctx.hwnds) {
+            SendMessageTimeoutW(hWnd, WM_CLOSE, 0, 0, SMTO_ABORTIFHUNG, 500, nullptr);
+        }
+
+        // 2. 프로세스 핸들 열기 (PROCESS_TERMINATE | SYNCHRONIZE)
+        HANDLE hProc = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
+        if (hProc) {
+            DWORD waitRes = WaitForSingleObject(hProc, 1500);
+            if (waitRes != WAIT_OBJECT_0) {
+                TerminateProcess(hProc, 0);
+                WaitForSingleObject(hProc, 2000);
+            }
+            CloseHandle(hProc);
+        }
+    }
+
+    Sleep(300);
+    return true;
+}
+
 
 static std::wstring formatBytes(uint64_t bytes) {
     double d = static_cast<double>(bytes);
@@ -437,21 +562,41 @@ static INT_PTR CALLBACK WizardDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM
             SendMessageW(hDlg, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(hIcon));
         }
 
-        // 기본 설치 경로 결정
-        wchar_t baseFolder[MAX_PATH];
-        if (state->meta.defaultScope == EasyInstallScope::PerMachine) {
-            SHGetSpecialFolderPathW(nullptr, baseFolder, CSIDL_PROGRAM_FILES, FALSE);
-        } else {
-            SHGetSpecialFolderPathW(nullptr, baseFolder, CSIDL_LOCAL_APPDATA, FALSE);
-            PathAppendW(baseFolder, L"Programs");
+        // 기존 설치 경로가 레지스트리에 등록되어 있는지 우선 확인 (버전업 재설치 지원)
+        bool foundExistingPath = false;
+        const HKEY searchRoots[] = { HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER };
+        for (HKEY hRoot : searchRoots) {
+            std::wstring subKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\" + state->meta.appName;
+            HKEY hKey = nullptr;
+            if (RegOpenKeyExW(hRoot, subKey.c_str(), 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+                wchar_t existingPath[MAX_PATH] = { 0 };
+                DWORD dwSize = sizeof(existingPath);
+                DWORD dwType = REG_SZ;
+                if (RegQueryValueExW(hKey, L"InstallLocation", nullptr, &dwType, reinterpret_cast<LPBYTE>(existingPath), &dwSize) == ERROR_SUCCESS && wcslen(existingPath) > 0) {
+                    state->installPath = existingPath;
+                    foundExistingPath = true;
+                }
+                RegCloseKey(hKey);
+            }
+            if (foundExistingPath) break;
         }
-        std::wstring defaultDir = std::wstring(baseFolder) + L"\\" + state->meta.defaultInstallDir;
-        state->installPath = defaultDir;
-        SetDlgItemTextW(hDlg, IDC_EDIT_INSTALL_PATH, defaultDir.c_str());
+
+        if (!foundExistingPath) {
+            // 기본 설치 경로 결정
+            wchar_t baseFolder[MAX_PATH];
+            if (state->meta.defaultScope == EasyInstallScope::PerMachine) {
+                SHGetSpecialFolderPathW(nullptr, baseFolder, CSIDL_PROGRAM_FILES, FALSE);
+            } else {
+                SHGetSpecialFolderPathW(nullptr, baseFolder, CSIDL_LOCAL_APPDATA, FALSE);
+                PathAppendW(baseFolder, L"Programs");
+            }
+            state->installPath = std::wstring(baseFolder) + L"\\" + state->meta.defaultInstallDir;
+        }
+        SetDlgItemTextW(hDlg, IDC_EDIT_INSTALL_PATH, state->installPath.c_str());
 
         // 필요한 공간 표시
         SetDlgItemTextW(hDlg, IDC_STATIC_SPACE_REQ, (L"필요한 공간: " + formatBytes(state->meta.uncompressedSize)).c_str());
-        updateFreeSpace(hDlg, defaultDir);
+        updateFreeSpace(hDlg, state->installPath);
 
         // 옵션 체크박스 기본값
         CheckDlgButton(hDlg, IDC_CHK_OPT_DESKTOP, state->meta.createDesktopShortcut ? BST_CHECKED : BST_UNCHECKED);
@@ -517,6 +662,31 @@ static INT_PTR CALLBACK WizardDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM
                 if (state->installPath.empty()) {
                     MessageBoxW(hDlg, L"설치 폴더 경로를 입력해 주십시오.", L"안내", MB_OK | MB_ICONWARNING);
                     return TRUE;
+                }
+
+                // 실행 중인 기존 프로세스 감지 및 관리자 권한 프로세스 종료 처리
+                enableDebugPrivilege();
+                std::vector<DWORD> runningPids = findRunningProcesses(state->installPath, state->meta.mainExeName);
+                if (!runningPids.empty()) {
+                    std::wstring msg = L"현재 '" + state->meta.appName + L"' 프로그램이 실행 중입니다.\n\n"
+                                       L"새 버전을 설치하려면 실행 중인 프로그램을 종료해야 합니다.\n"
+                                       L"실행 중인 프로그램을 자동으로 종료하고 설치를 계속 진행하시겠습니까?";
+                    int ans = MessageBoxW(hDlg, msg.c_str(), L"실행 중인 프로그램 감지", MB_YESNO | MB_ICONQUESTION);
+                    if (ans != IDYES) {
+                        return TRUE;
+                    }
+
+                    // 프로세스 종료 시도
+                    terminateTargetProcesses(runningPids);
+
+                    // 재검사: 완전히 종료되었는지 확인
+                    std::vector<DWORD> stillRunning = findRunningProcesses(state->installPath, state->meta.mainExeName);
+                    if (!stillRunning.empty()) {
+                        MessageBoxW(hDlg,
+                            (L"실행 중인 '" + state->meta.appName + L"' 프로그램을 종료하지 못했습니다.\n작업 관리자에서 프로그램을 직접 종료한 후 다시 시도해 주십시오.").c_str(),
+                            L"프로그램 종료 실패", MB_OK | MB_ICONERROR);
+                        return TRUE;
+                    }
                 }
 
                 state->createDesktop = (IsDlgButtonChecked(hDlg, IDC_CHK_OPT_DESKTOP) == BST_CHECKED);

@@ -140,4 +140,13 @@ AI 에이전트(당신)가 개발 중 **실제로 저질렀던 치명적인 실�
   2. 설치 워커 루틴에서는 디렉터리 생성(`SHCreateDirectoryExW`), 압축 해제(`mz_zip_reader_extract_to_heap`), 파일 쓰기(`CreateFileW`, `WriteFile`)의 반환값을 100% 엄격히 검사하여 실패 즉시 중단하고 상세 에러 메시지(오류 코드, 경로 등)를 수집하여 실패 화면으로 유도할 것 (가짜 성공 절대 금지).
   3. 바로가기 등록 시 `CSIDL_COMMON_*` 실패에 대비하여 `CSIDL_*`(사용자 전용)으로의 안전한 폴백을 구축할 것.
 
+### 🔄 버전업(재설치) 시 관리자 권한 프로세스 파일 잠금(`ERROR_SHARING_VIOLATION`) 방지 및 자동 종료 시퀀스
+- **실제 실수 및 잠재 함정**: 구버전 프로그램이 관리자 권한(Elevated)으로 백그라운드나 포그라운드에서 실행 중인 상태에서 사용자가 새 버전 인스톨러로 덮어쓰기 설치를 시도하면, 실행 파일(`.exe`, `.dll`)에 OS 파일 잠금(File Lock)이 걸려 `CreateFileW(..., CREATE_ALWAYS)` 시 `ERROR_SHARING_VIOLATION`(32) 또는 `ERROR_ACCESS_DENIED`(5)로 설치가 실패함. 또한 일반 권한으로는 관리자 권한 프로세스에 `PROCESS_TERMINATE` 핸들을 열지 못함.
+- **방지 원칙**:
+  1. `SeDebugPrivilege` 활성화: 인스톨러 토큰에 `AdjustTokenPrivileges(SE_DEBUG_NAME)`을 선행 활성화하여 관리자 권한 프로세스라도 안전하게 제어/종료할 수 있는 시스템 디버그 권한을 확보할 것.
+  2. 대상 설치 디렉터리 기반 정밀 타겟팅: 단순 파일명 대조에 그치지 않고 `QueryFullProcessImageNameW`를 통해 대상 설치 폴더(`installPath`)에 속한 프로세스인지 100% 대조하여 무관한 동명 프로세스 오종료를 원천 차단할 것.
+  3. 2단계 종료 시퀀스: 사용자에게 종료 동의를 구한 뒤, 먼저 `WM_CLOSE` 정상 종료(Graceful close)를 시도하고 타임아웃(1.5초) 초과 시 `TerminateProcess`로 강제 종료한 후 `WaitForSingleObject`로 프로세스 핸들이 완전히 닫힐 때까지 대기하여 파일 잠금이 해제된 후 파일 쓰기를 시작할 것.
+  4. 이전 설치 경로 우선 탐색: 레지스트리 `Uninstall` 키의 `InstallLocation`을 조회하여 커스텀 경로 사용자도 원클릭 재설치(업그레이드)가 가능하도록 지원할 것.
+
+
 
