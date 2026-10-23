@@ -1,0 +1,20 @@
+# Visual Studio
+.vs/
+*.user
+
+# Build output
+bin/
+obj/
+x64/
+Debug/
+Release/
+
+# Packages and Dist
+*.zip
+*.log
+dist/
+test_output/
+
+# OS generated
+Thumbs.db
+Desktop.ini
