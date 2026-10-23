@@ -138,24 +138,36 @@ static bool safeRemoveDirectory(const std::wstring& dirPath, int retries = 10, i
 }
 
 static void deleteDirectoryRecursive(const std::wstring& dirPath) {
+    // 1. Windows Shell의 공식 폴더 삭제 API(SHFileOperationW) 우선 시도 (더블 널 종료 필요)
+    std::vector<wchar_t> doubleNullPath(dirPath.size() + 2, 0);
+    wmemcpy(doubleNullPath.data(), dirPath.c_str(), dirPath.size());
+
+    SHFILEOPSTRUCTW sfo = { 0 };
+    sfo.wFunc = FO_DELETE;
+    sfo.pFrom = doubleNullPath.data();
+    sfo.fFlags = FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI;
+    if (SHFileOperationW(&sfo) == 0 && !PathFileExistsW(dirPath.c_str())) {
+        return;
+    }
+
+    // 2. 수동 재귀 삭제 폴백
     std::wstring searchPattern = dirPath + L"\\*";
     WIN32_FIND_DATAW fd;
     HANDLE hFind = FindFirstFileW(searchPattern.c_str(), &fd);
-    if (hFind == INVALID_HANDLE_VALUE) return;
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
 
-    do {
-        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-
-        std::wstring itemPath = dirPath + L"\\" + fd.cFileName;
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            deleteDirectoryRecursive(itemPath);
-        } else {
-            safeDeleteFile(itemPath);
-        }
-    } while (FindNextFileW(hFind, &fd));
-
-    FindClose(hFind);
-    safeRemoveDirectory(dirPath);
+            std::wstring itemPath = dirPath + L"\\" + fd.cFileName;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                deleteDirectoryRecursive(itemPath);
+            } else {
+                safeDeleteFile(itemPath);
+            }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
+    safeRemoveDirectory(dirPath, 15, 100);
 }
 
 static void removeShortcutsAndRegistry(const std::wstring& appName, EasyInstallScope scope) {
@@ -267,6 +279,7 @@ static INT_PTR CALLBACK UninstDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM
             sei.lpVerb = (s_meta.defaultScope == EasyInstallScope::PerMachine) ? L"runas" : L"open";
             sei.lpFile = tempExe;
             sei.lpParameters = args.c_str();
+            sei.lpDirectory = tempDir; // 현재 설치 폴더 잠금 방지를 위해 작업 디렉터리를 임시 폴더로 격리
             sei.nShow = SW_SHOW;
 
             if (ShellExecuteExW(&sei)) {
@@ -304,6 +317,11 @@ int Uninstaller::run(HINSTANCE hInstance, const std::wstring& cmdLine) {
             }
 
             if (workerIdx >= 0 && (workerIdx + 2) < argc) {
+                // 워커 프로세스 작업 디렉터리를 즉시 임시 폴더로 전환 (대상 폴더 디렉터리 잠금 해제)
+                wchar_t tempDir[MAX_PATH] = { 0 };
+                GetTempPathW(MAX_PATH, tempDir);
+                SetCurrentDirectoryW(tempDir);
+
                 std::wstring targetDir = argv[workerIdx + 1];
                 std::wstring appName = argv[workerIdx + 2];
                 EasyInstallScope scope = EasyInstallScope::PerMachine;

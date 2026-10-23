@@ -161,6 +161,14 @@ AI 에이전트(당신)가 개발 중 **실제로 저질렀던 치명적인 실�
   1. 제거 시작 다이얼로그(`UninstDlgProc`) 및 백그라운드 워커(`--uninstall-worker`) 양쪽 모두에서, 파일 삭제 직전 설치 디렉터리(`targetDir`) 내에 존재하는 모든 프로세스를 탐색하여 `WM_CLOSE` 및 `TerminateProcess`로 완전히 안전 종료한 후 파일 삭제(`deleteDirectoryRecursive`)를 시작할 것.
   2. 관리자 권한 프로세스 종료를 위해 언인스톨러 워커에서도 `enableDebugPrivilege()`를 선행 호출할 것.
 
+### 📁 언인스톨러 워커의 현재 작업 디렉터리(CWD) 상속으로 인한 설치 루트 폴더 삭제 거부 방지
+- **실제 실수**: 워커 프로세스(`--uninstall-worker`)를 임시 폴더에서 실행할 때 `ShellExecuteExW`의 `lpDirectory`를 지정하지 않고, 워커 프로세스 내에서도 `SetCurrentDirectoryW`를 호출하지 않음. 이로 인해 부모 프로세스(`uninstall.exe`)의 현재 작업 디렉터리(`C:\Program Files\<AppName>`)가 그대로 상속되어 OS 디렉터리 핸들(Directory Lock)이 걸림. 내부 파일들은 정상 삭제되지만 최상위 폴더 자체의 `RemoveDirectoryW`가 거부되어 빈 폴더가 영구히 남는 치명적인 결함 발생.
+- **방지 원칙**:
+  1. `ShellExecuteExW` 실행 시 `sei.lpDirectory = tempDir`를 명시적으로 전달할 것.
+  2. 워커 프로세스 시작 즉시 `SetCurrentDirectoryW(tempDir)`를 호출하여 대상 설치 디렉터리에 걸려 있는 CWD 핸들을 완전히 해제할 것.
+  3. 폴더 삭제 시 Windows Shell 공식 API인 `SHFileOperationW`(FO_DELETE)를 선행 적용하여 원자적 폴더 완전 삭제를 보장할 것.
+
+
 
 
 
