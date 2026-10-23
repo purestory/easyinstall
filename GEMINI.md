@@ -152,7 +152,15 @@ AI 에이전트(당신)가 개발 중 **실제로 저질렀던 치명적인 실�
 - **실제 실수 및 함정**: Windows 11의 시작 메뉴(모든 앱)는 `*제거*.lnk`나 `*Uninstall*.lnk`를 시스템 정책상 자동으로 숨김(Hidden) 처리함. 이로 인해 폴더 내에 메인 바로가기 1개와 제거 바로가기 1개만 넣으면, Windows 11 인덱서는 유효 바로가기가 1개뿐이라고 판단하여 **폴더를 강제로 없애고(Flattening) 앱 아이콘 1개만 최상위 목록에 노출**시키는 현상이 일어남.
 - **방지 원칙**:
   1. Windows 11에서 노란 폴더 그룹이 확실히 보존되도록, 숨김 필터링되지 않는 **유효한 보조 항목(`[AppName] 폴더.lnk` - 탐색기 설치 폴더 열기)**을 필수 배치하여 폴더 내 유효 항목을 최소 2개 이상 유지할 것.
-  2. `CSIDL_COMMON_PROGRAMS` 실패 시 `CSIDL_PROGRAMS`로의 안전한 폴백을 구축하고, 바로가기 생성 후 `SHChangeNotify(SHCNE_MKDIR)` 및 `SHChangeNotify(SHCNE_UPDATEDIR)`를 명시적으로 호출하여 셸 캐시를 즉시 갱신할 것.
+  2. 시스템 바로가기 전용 아이콘 적용: 폴더 바로가기에는 `shell32.dll, 3`(표준 노란 폴더 아이콘), 제거 바로가기에는 `shell32.dll, 31`(표준 휴지통 아이콘)을 매핑하여 가독성과 직관성을 극대화할 것.
+  3. `CSIDL_COMMON_PROGRAMS` 실패 시 `CSIDL_PROGRAMS`로의 안전한 폴백을 구축하고, 바로가기 생성 후 `SHChangeNotify(SHCNE_MKDIR)` 및 `SHChangeNotify(SHCNE_UPDATEDIR)`를 명시적으로 호출하여 셸 캐시를 즉시 갱신할 것.
+
+### 🗑️ 언인스톨러(제거) 실행 중 프로세스 미종료 및 파일 잔여 버그 방지
+- **실제 실수**: 언인스톨러(`uninstall.exe`)가 원본 인스톨러 핸들만 닫히길 기다리고, 메인 프로그램이나 백그라운드 프로세스(`SysMonitorHost.exe` 등)가 켜져 있는지 확인하지 않고 파일 삭제를 시도함. 이로 인해 실행 중인 바이너리에 파일 잠금(File Lock)이 걸려 `DeleteFileW`가 실패하면서 제어판 정보만 지워지고 실제 파일은 그대로 방치되는 찌꺼기 버그가 발생함.
+- **방지 원칙**:
+  1. 제거 시작 다이얼로그(`UninstDlgProc`) 및 백그라운드 워커(`--uninstall-worker`) 양쪽 모두에서, 파일 삭제 직전 설치 디렉터리(`targetDir`) 내에 존재하는 모든 프로세스를 탐색하여 `WM_CLOSE` 및 `TerminateProcess`로 완전히 안전 종료한 후 파일 삭제(`deleteDirectoryRecursive`)를 시작할 것.
+  2. 관리자 권한 프로세스 종료를 위해 언인스톨러 워커에서도 `enableDebugPrivilege()`를 선행 호출할 것.
+
 
 
 

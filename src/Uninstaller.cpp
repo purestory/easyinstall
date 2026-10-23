@@ -4,10 +4,116 @@
 #include <shlobj.h>
 #include <shlwapi.h>
 #include <commctrl.h>
+#include <tlhelp32.h>
 #include <vector>
 
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "comctl32.lib")
+
+// 관리자 권한 프로세스 제어를 위한 디버그 권한 활성화
+static bool enableDebugPrivilege() {
+    HANDLE hToken = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+        return false;
+    }
+    LUID luid;
+    if (!LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &luid)) {
+        CloseHandle(hToken);
+        return false;
+    }
+    TOKEN_PRIVILEGES tp;
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    BOOL ok = AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+    DWORD dwErr = GetLastError();
+    CloseHandle(hToken);
+    return (ok && dwErr != ERROR_NOT_ALL_ASSIGNED);
+}
+
+struct UninstCloseContext {
+    DWORD pid;
+    std::vector<HWND> hwnds;
+};
+
+static BOOL CALLBACK EnumWindowsUninstProc(HWND hWnd, LPARAM lParam) {
+    auto* ctx = reinterpret_cast<UninstCloseContext*>(lParam);
+    DWORD wndPid = 0;
+    GetWindowThreadProcessId(hWnd, &wndPid);
+    if (wndPid == ctx->pid && IsWindowVisible(hWnd)) {
+        ctx->hwnds.push_back(hWnd);
+    }
+    return TRUE;
+}
+
+// 대상 설치 폴더에서 실행 중인 모든 프로세스(PID) 검색
+static std::vector<DWORD> findProcessesInDir(const std::wstring& targetDir) {
+    std::vector<DWORD> pids;
+    DWORD currentPid = GetCurrentProcessId();
+
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return pids;
+
+    std::wstring normTargetDir = targetDir;
+    while (!normTargetDir.empty() && (normTargetDir.back() == L'\\' || normTargetDir.back() == L'/')) {
+        normTargetDir.pop_back();
+    }
+    for (wchar_t& c : normTargetDir) c = towlower(c);
+
+    PROCESSENTRY32W pe = { sizeof(pe) };
+    if (Process32FirstW(hSnap, &pe)) {
+        do {
+            if (pe.th32ProcessID == currentPid || pe.th32ProcessID <= 4) {
+                continue;
+            }
+
+            HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+            if (hProc) {
+                wchar_t fullPath[MAX_PATH] = { 0 };
+                DWORD size = MAX_PATH;
+                if (QueryFullProcessImageNameW(hProc, 0, fullPath, &size)) {
+                    std::wstring lowerFullPath = fullPath;
+                    for (wchar_t& c : lowerFullPath) c = towlower(c);
+
+                    if (!normTargetDir.empty() && lowerFullPath.find(normTargetDir) == 0) {
+                        pids.push_back(pe.th32ProcessID);
+                    }
+                }
+                CloseHandle(hProc);
+            }
+        } while (Process32NextW(hSnap, &pe));
+    }
+    CloseHandle(hSnap);
+    return pids;
+}
+
+// 대상 설치 폴더에서 실행 중인 프로세스 일괄 안전 종료
+static void terminateProcessesInDir(const std::wstring& targetDir) {
+    enableDebugPrivilege();
+    std::vector<DWORD> pids = findProcessesInDir(targetDir);
+    for (DWORD pid : pids) {
+        // 1. WM_CLOSE 정상 종료 시도
+        UninstCloseContext ctx = { pid, {} };
+        EnumWindows(EnumWindowsUninstProc, reinterpret_cast<LPARAM>(&ctx));
+        for (HWND hWnd : ctx.hwnds) {
+            SendMessageTimeoutW(hWnd, WM_CLOSE, 0, 0, SMTO_ABORTIFHUNG, 500, nullptr);
+        }
+
+        // 2. 프로세스 핸들 열기 및 강제 종료
+        HANDLE hProc = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
+        if (hProc) {
+            DWORD waitRes = WaitForSingleObject(hProc, 1500);
+            if (waitRes != WAIT_OBJECT_0) {
+                TerminateProcess(hProc, 0);
+                WaitForSingleObject(hProc, 2000);
+            }
+            CloseHandle(hProc);
+        }
+    }
+    if (!pids.empty()) {
+        Sleep(300);
+    }
+}
 
 static bool safeDeleteFile(const std::wstring& filePath, int retries = 10, int delayMs = 150) {
     SetFileAttributesW(filePath.c_str(), FILE_ATTRIBUTE_NORMAL);
@@ -124,6 +230,21 @@ static INT_PTR CALLBACK UninstDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM
             wcscpy_s(installDir, selfExe);
             PathRemoveFileSpecW(installDir);
 
+            // 실행 중인 프로그램 감지 및 사용자 안내
+            std::vector<DWORD> running = findProcessesInDir(installDir);
+            if (!running.empty()) {
+                std::wstring msg = s_meta.appName + L" 프로그램 또는 관련 프로세스가 현재 실행 중입니다.\n\n프로그램을 완전히 제거하기 위해 실행 중인 프로세스를 자동으로 종료하고 계속 진행하시겠습니까?";
+                int choice = MessageBoxW(hDlg, msg.c_str(), L"실행 중인 프로그램 감지", MB_YESNO | MB_ICONQUESTION);
+                if (choice != IDYES) {
+                    EnableWindow(GetDlgItem(hDlg, IDC_BTN_UNINST_START), TRUE);
+                    EnableWindow(GetDlgItem(hDlg, IDC_BTN_UNINST_CANCEL), TRUE);
+                    SendDlgItemMessageW(hDlg, IDC_PROGRESS_UNINSTALL, PBM_SETPOS, 0, 0);
+                    SetDlgItemTextW(hDlg, IDC_STATIC_UNINST_STATUS, L"제거가 취소되었습니다.");
+                    return TRUE;
+                }
+                terminateProcessesInDir(installDir);
+            }
+
             // 임시 폴더에 복제
             wchar_t tempDir[MAX_PATH];
             GetTempPathW(MAX_PATH, tempDir);
@@ -203,6 +324,10 @@ int Uninstaller::run(HINSTANCE hInstance, const std::wstring& cmdLine) {
                     }
                 }
                 Sleep(500);
+
+                // 설치 폴더 내 남아있는 모든 프로세스(워커, 백그라운드 프로세스 등) 일괄 강제 종료
+                terminateProcessesInDir(targetDir);
+                Sleep(300);
 
                 // 바로가기 및 레지스트리 제거
                 removeShortcutsAndRegistry(appName, scope);
