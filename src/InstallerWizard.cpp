@@ -55,7 +55,7 @@ static BOOL CALLBACK EnumWindowsCloseProc(HWND hWnd, LPARAM lParam) {
     return TRUE;
 }
 
-// 대상 설치 폴더에서 실행 중인 대상 프로그램 프로세스(PID) 검색
+// 대상 설치 폴더에서 실행 중인 모든 관련 프로세스(PID) 검색 (메인 exe 및 서브 워커 프로세스 일체 포함)
 static std::vector<DWORD> findRunningProcesses(const std::wstring& targetDir, const std::wstring& mainExeName) {
     std::vector<DWORD> pids;
     DWORD currentPid = GetCurrentProcessId();
@@ -82,28 +82,26 @@ static std::vector<DWORD> findRunningProcesses(const std::wstring& targetDir, co
             std::wstring curExe = pe.szExeFile;
             for (wchar_t& c : curExe) c = towlower(c);
 
-            if (curExe == lowerExeName) {
-                // 관리자 권한 프로세스도 경로를 조회할 수 있도록 PROCESS_QUERY_LIMITED_INFORMATION 사용
-                HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
-                if (hProc) {
-                    wchar_t fullPath[MAX_PATH] = { 0 };
-                    DWORD size = MAX_PATH;
-                    if (QueryFullProcessImageNameW(hProc, 0, fullPath, &size)) {
-                        std::wstring lowerFullPath = fullPath;
-                        for (wchar_t& c : lowerFullPath) c = towlower(c);
+            // 관리자 권한 프로세스도 경로를 조회할 수 있도록 PROCESS_QUERY_LIMITED_INFORMATION 사용
+            HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+            if (hProc) {
+                wchar_t fullPath[MAX_PATH] = { 0 };
+                DWORD size = MAX_PATH;
+                if (QueryFullProcessImageNameW(hProc, 0, fullPath, &size)) {
+                    std::wstring lowerFullPath = fullPath;
+                    for (wchar_t& c : lowerFullPath) c = towlower(c);
 
-                        // 대상 디렉터리 내에 위치한 프로세스인지 확인
-                        if (lowerFullPath.find(normTargetDir) == 0) {
-                            pids.push_back(pe.th32ProcessID);
-                        }
-                    } else {
-                        // 권한 등으로 전체 경로 조회가 불가하더라도 동명 프로세스이면 감지 목록에 포함
+                    // 대상 설치 디렉터리 내에 위치한 프로세스이면 (메인 exe, 서브 워커 등 모두 포함)
+                    if (!normTargetDir.empty() && lowerFullPath.find(normTargetDir) == 0) {
                         pids.push_back(pe.th32ProcessID);
                     }
-                    CloseHandle(hProc);
-                } else {
+                } else if (!lowerExeName.empty() && curExe == lowerExeName) {
+                    // 권한 등으로 전체 경로 조회가 불가하더라도 메인 실행 파일명과 일치하면 포함
                     pids.push_back(pe.th32ProcessID);
                 }
+                CloseHandle(hProc);
+            } else if (!lowerExeName.empty() && curExe == lowerExeName) {
+                pids.push_back(pe.th32ProcessID);
             }
         } while (Process32NextW(hSnap, &pe));
     }
@@ -153,12 +151,9 @@ static std::wstring formatBytes(uint64_t bytes) {
     return ss.str();
 }
 
-static bool createShortcut(const std::wstring& targetExePath, const std::wstring& shortcutPath, const std::wstring& description, const std::wstring& workingDir, const std::wstring& arguments = L"") {
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    bool coInited = SUCCEEDED(hr);
-
+static bool createShortcut(const std::wstring& targetExePath, const std::wstring& shortcutPath, const std::wstring& description, const std::wstring& workingDir, const std::wstring& arguments = L"", const std::wstring& iconPath = L"") {
     IShellLinkW* psl = nullptr;
-    hr = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_IShellLinkW, reinterpret_cast<void**>(&psl));
+    HRESULT hr = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_IShellLinkW, reinterpret_cast<void**>(&psl));
     if (SUCCEEDED(hr)) {
         psl->SetPath(targetExePath.c_str());
         if (!arguments.empty()) {
@@ -170,6 +165,9 @@ static bool createShortcut(const std::wstring& targetExePath, const std::wstring
         if (!workingDir.empty()) {
             psl->SetWorkingDirectory(workingDir.c_str());
         }
+        if (!iconPath.empty()) {
+            psl->SetIconLocation(iconPath.c_str(), 0);
+        }
 
         IPersistFile* ppf = nullptr;
         hr = psl->QueryInterface(IID_IPersistFile, reinterpret_cast<void**>(&ppf));
@@ -179,8 +177,6 @@ static bool createShortcut(const std::wstring& targetExePath, const std::wstring
         }
         psl->Release();
     }
-
-    if (coInited) CoUninitialize();
     return SUCCEEDED(hr);
 }
 
@@ -485,21 +481,43 @@ static void runInstallWorker(HWND hDlg, WizardState* state) {
 
     // 3. 시작 메뉴 바로가기 및 프로그램 폴더 구성
     if (state->createStartMenu) {
-        wchar_t programsDir[MAX_PATH];
+        wchar_t programsDir[MAX_PATH] = { 0 };
         int csidl = (state->meta.defaultScope == EasyInstallScope::PerMachine) ? CSIDL_COMMON_PROGRAMS : CSIDL_PROGRAMS;
         if (!SHGetSpecialFolderPathW(nullptr, programsDir, csidl, FALSE)) {
             SHGetSpecialFolderPathW(nullptr, programsDir, CSIDL_PROGRAMS, FALSE);
         }
         std::wstring appMenuDir = std::wstring(programsDir) + L"\\" + state->meta.appName;
-        SHCreateDirectoryExW(nullptr, appMenuDir.c_str(), nullptr);
+        int dirErr = SHCreateDirectoryExW(nullptr, appMenuDir.c_str(), nullptr);
+        // 만약 관리자 권한 시작메뉴 폴더 생성이 실패했다면 사용자 폴더로 폴백
+        if (dirErr != ERROR_SUCCESS && dirErr != ERROR_ALREADY_EXISTS && dirErr != ERROR_FILE_EXISTS) {
+            if (csidl == CSIDL_COMMON_PROGRAMS) {
+                if (SHGetSpecialFolderPathW(nullptr, programsDir, CSIDL_PROGRAMS, FALSE)) {
+                    appMenuDir = std::wstring(programsDir) + L"\\" + state->meta.appName;
+                    SHCreateDirectoryExW(nullptr, appMenuDir.c_str(), nullptr);
+                }
+            }
+        }
 
-        // 실행 바로가기
+        // 1) 메인 실행 바로가기 (예: VolumeControl.lnk)
         std::wstring shortcutPath = appMenuDir + L"\\" + state->meta.appName + L".lnk";
         createShortcut(mainExePath, shortcutPath, state->meta.appName, targetDir);
 
-        // 제거 바로가기 (폴더 내 2개 이상의 항목을 배치하여 Windows 10/11 시작메뉴가 폴더 그룹으로 표시하도록 강제)
+        // 2) 프로그램 폴더 열기 바로가기 (Windows 10/11 시작 메뉴 폴더 평탄화/증발 방지용 필수 보조 항목)
+        // Windows 11은 유효한 바로가기가 1개뿐이면 폴더를 숨기고 앱 아이콘만 단독 노출하므로,
+        // 숨김 필터링되지 않는 보조 항목을 배치하여 시작 메뉴에 정식 폴더 그룹으로 표시되도록 보장
+        wchar_t winDir[MAX_PATH] = { 0 };
+        GetWindowsDirectoryW(winDir, MAX_PATH);
+        std::wstring explorerPath = std::wstring(winDir) + L"\\explorer.exe";
+        std::wstring folderShortcutPath = appMenuDir + L"\\" + state->meta.appName + L" 폴더.lnk";
+        createShortcut(explorerPath, folderShortcutPath, state->meta.appName + L" 설치 폴더", targetDir, targetDir, mainExePath);
+
+        // 3) 제거 바로가기
         std::wstring uninstShortcutPath = appMenuDir + L"\\" + state->meta.appName + L" 제거.lnk";
-        createShortcut(uninstExePath, uninstShortcutPath, state->meta.appName + L" 제거", targetDir, L"--uninstall");
+        createShortcut(uninstExePath, uninstShortcutPath, state->meta.appName + L" 제거", targetDir, L"--uninstall", uninstExePath);
+
+        // 4) 시작 메뉴 셸 인덱서 및 디렉터리 캐시 즉시 갱신
+        SHChangeNotify(SHCNE_MKDIR, SHCNF_PATH, appMenuDir.c_str(), nullptr);
+        SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATH, appMenuDir.c_str(), nullptr);
     }
 
     // 4. 제어판 [앱 및 기능] 등록

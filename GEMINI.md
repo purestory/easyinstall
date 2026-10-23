@@ -141,12 +141,19 @@ AI 에이전트(당신)가 개발 중 **실제로 저질렀던 치명적인 실�
   3. 바로가기 등록 시 `CSIDL_COMMON_*` 실패에 대비하여 `CSIDL_*`(사용자 전용)으로의 안전한 폴백을 구축할 것.
 
 ### 🔄 버전업(재설치) 시 관리자 권한 프로세스 파일 잠금(`ERROR_SHARING_VIOLATION`) 방지 및 자동 종료 시퀀스
-- **실제 실수 및 잠재 함정**: 구버전 프로그램이 관리자 권한(Elevated)으로 백그라운드나 포그라운드에서 실행 중인 상태에서 사용자가 새 버전 인스톨러로 덮어쓰기 설치를 시도하면, 실행 파일(`.exe`, `.dll`)에 OS 파일 잠금(File Lock)이 걸려 `CreateFileW(..., CREATE_ALWAYS)` 시 `ERROR_SHARING_VIOLATION`(32) 또는 `ERROR_ACCESS_DENIED`(5)로 설치가 실패함. 또한 일반 권한으로는 관리자 권한 프로세스에 `PROCESS_TERMINATE` 핸들을 열지 못함.
+- **실제 실수 및 잠재 함정**: 구버전 프로그램이 관리자 권한(Elevated)으로 백그라운드나 포그라운드에서 실행 중인 상태에서 사용자가 새 버전 인스톨러로 덮어쓰기 설치를 시도하면, 실행 파일(`.exe`, `.dll`)에 OS 파일 잠금(File Lock)이 걸려 `CreateFileW(..., CREATE_ALWAYS)` 시 `ERROR_SHARING_VIOLATION`(32) 또는 `ERROR_ACCESS_DENIED`(5)로 설치가 실패함. 또한 메인 실행 파일명 1개만 검사하면 백그라운드 모니터링/워커 프로세스(`SysMonitorHost.exe` 등)가 감지되지 않아 여전히 파일 잠금으로 실패함.
 - **방지 원칙**:
   1. `SeDebugPrivilege` 활성화: 인스톨러 토큰에 `AdjustTokenPrivileges(SE_DEBUG_NAME)`을 선행 활성화하여 관리자 권한 프로세스라도 안전하게 제어/종료할 수 있는 시스템 디버그 권한을 확보할 것.
-  2. 대상 설치 디렉터리 기반 정밀 타겟팅: 단순 파일명 대조에 그치지 않고 `QueryFullProcessImageNameW`를 통해 대상 설치 폴더(`installPath`)에 속한 프로세스인지 100% 대조하여 무관한 동명 프로세스 오종료를 원천 차단할 것.
+  2. 대상 설치 디렉터리 기반 포괄적 타겟팅: 단순 메인 실행 파일명 1개만 검사하지 말고, `QueryFullProcessImageNameW`를 통해 대상 설치 폴더(`installPath`) 내에 속한 **모든 프로세스(메인 exe + 백그라운드 헬퍼/워커 일체)**를 100% 탐색하여 일괄 종료할 것.
   3. 2단계 종료 시퀀스: 사용자에게 종료 동의를 구한 뒤, 먼저 `WM_CLOSE` 정상 종료(Graceful close)를 시도하고 타임아웃(1.5초) 초과 시 `TerminateProcess`로 강제 종료한 후 `WaitForSingleObject`로 프로세스 핸들이 완전히 닫힐 때까지 대기하여 파일 잠금이 해제된 후 파일 쓰기를 시작할 것.
   4. 이전 설치 경로 우선 탐색: 레지스트리 `Uninstall` 키의 `InstallLocation`을 조회하여 커스텀 경로 사용자도 원클릭 재설치(업그레이드)가 가능하도록 지원할 것.
+
+### 📁 Windows 10/11 시작 메뉴 폴더 평탄화(Flattening / Folder Suppression) 원천 차단
+- **실제 실수 및 함정**: Windows 11의 시작 메뉴(모든 앱)는 `*제거*.lnk`나 `*Uninstall*.lnk`를 시스템 정책상 자동으로 숨김(Hidden) 처리함. 이로 인해 폴더 내에 메인 바로가기 1개와 제거 바로가기 1개만 넣으면, Windows 11 인덱서는 유효 바로가기가 1개뿐이라고 판단하여 **폴더를 강제로 없애고(Flattening) 앱 아이콘 1개만 최상위 목록에 노출**시키는 현상이 일어남.
+- **방지 원칙**:
+  1. Windows 11에서 노란 폴더 그룹이 확실히 보존되도록, 숨김 필터링되지 않는 **유효한 보조 항목(`[AppName] 폴더.lnk` - 탐색기 설치 폴더 열기)**을 필수 배치하여 폴더 내 유효 항목을 최소 2개 이상 유지할 것.
+  2. `CSIDL_COMMON_PROGRAMS` 실패 시 `CSIDL_PROGRAMS`로의 안전한 폴백을 구축하고, 바로가기 생성 후 `SHChangeNotify(SHCNE_MKDIR)` 및 `SHChangeNotify(SHCNE_UPDATEDIR)`를 명시적으로 호출하여 셸 캐시를 즉시 갱신할 것.
+
 
 
 
