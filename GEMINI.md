@@ -37,6 +37,18 @@ AI 에이전트(당신)가 개발 중 **실제로 저질렀던 치명적인 실�
 - **배포 산출물 중복 생성 및 패치 수정 시 버전(Version) 미갱신 금지**:
   - 배포 아카이브는 중복 파일 없이 **단일 표준 버전 명칭(예: `easyinstall_v1.0.0_Portable.zip`) 딱 1개만** 정갈하게 생성할 것.
   - 코드/리소스 수정 및 배포가 발생하면 반드시 **시맨틱 버저닝(SemVer) 규칙에 따라 버전 번호를 명확히 상향(`v1.0.0` ➡️ `v1.0.1`)**하여 릴리스할 것.
+- **설치 프로그램(Setup.exe) 생성 시 외부 도구 탐색 낭비 금지 및 EasyInstall 표준 파이프라인 준수**:
+  - **실제 실수**: 설치 프로그램(Setup.exe) 생성 지시를 받았을 때, 프로젝트 환경에 구축된 자체 빌더를 확인하지 않고 Inno Setup(`iscc`), NSIS(`makensis`) 등 엉뚱한 외부 도구를 찾으며 헤매고 시간을 지체함. 동일 워크스페이스 그룹(`D:\coding\visualstudio\easyinstall`)에 전용 인스톨러 빌더가 이미 완성되어 있음에도 이를 즉시 활용하지 못함.
+  - **방지 원칙 (표준 배포 패키징 파이프라인)**:
+    1. **단일 설치 파일 빌더 절대 경로**:  
+       `& "D:\coding\visualstudio\easyinstall\bin\Release\easyinstall.exe" -i "<입력_바이너리_또는_폴더>" -o "<출력경로>\Setup.exe" -n "<프로그램명>" -v "<버전>" -p "purestory" -m "<메인_exe명>"`  
+       *(예: `& "D:\coding\visualstudio\easyinstall\bin\Release\easyinstall.exe" -i "D:\coding\visualstudio\clearMax\build\Release\clearMax.exe" -o "D:\coding\visualstudio\clearMax\ClearMax_Setup.exe" -n "clearMax" -v "1.14" -p "purestory" -m "clearMax.exe"`)*
+    2. **무설치 포터블 압축 아카이브 생성**:  
+       `powershell -Command "Compress-Archive -Path '<바이너리_경로>' -DestinationPath '<출력경로>\<프로그램명>_portable.zip' -Force"`
+    3. **GitHub Release 자동 배포 규격**:  
+       `gh release create <버전태그> <Setup.exe> <portable.zip> -F <릴리스노트.md> -t "<버전태그>"`
+    4. 설치 파일 생성 요구 시 타사 도구(`iscc`, `makensis` 등)를 일절 찾지 말고, 위 `easyinstall.exe` 절대 경로를 이용하여 즉시 1초 만에 원스톱으로 빌드할 것.
+
 
 ### 🛠️ 도구 사용 실수 방지: `replace_file_content` 줄 번호 포함 금지
 - **실제 실수**: `view_file`로 확인한 내용 앞의 줄 번호(`136: `, `150: ` 등)를 복사해 `TargetContent`나 `ReplacementContent`에 전달했다가 `chunk 0: target content not found` 에러를 반복 유발함.
@@ -70,6 +82,11 @@ AI 에이전트(당신)가 개발 중 **실제로 저질렀던 치명적인 실�
 - 구형 API인 `SetProcessDPIAware()`는 프로세스를 단일 시스템 DPI에 고정시킴. 이로 인해 다중 모니터(배율 불일치), 절전 모드(Sleep) 복귀, 화면 해상도/배율 변경 시 Windows DWM이 창을 강제로 비트맵 확대/축소(Bitmap Stretching)하여 폰트가 저해상도 이미지처럼 뭉개지고 블러(Blur) 처리되는 현상이 간헐적으로 발생함.
 - 반드시 런타임에 `SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)`를 최우선 적용(실패 시 `SetProcessDpiAwareness` -> `SetProcessDPIAware` Fallback)하여 DWM 가상화 확대를 원천 차단해야 함.
 - 또한 모든 폰트 높이(`CreateFontW`) 및 윈도우 배치 좌표/패딩은 `-MulDiv(기본픽셀, dpi, 96)`로 현재 모니터의 실제 DPI(`GetDpiForWindow`)에 비례하여 동적으로 계산하고, `WM_DPICHANGED`와 `WM_SETTINGCHANGE` / `WM_THEMECHANGED` 메시지를 핸들링하여 배율 및 테마 변화 시 레이아웃과 폰트를 즉시 갱신해야 함.
+
+### 🖼️ 고DPI 및 다중 환경 대응을 위한 아이콘(.ico) 멀티 해상도 패키징 원칙
+- 기본 단일 32×32 해상도 아이콘만 포함할 경우, Windows 탐색기의 '아주 큰 아이콘'(256px), '큰 아이콘'(48px), 작업표시줄, 고DPI 배율(125%, 150%, 200%) 환경에서 DWM에 의해 흐릿하게 강제 확대(비트맵 보간)되어 극심한 품질 저하가 발생함.
+- 반드시 256×256 (PNG 압축), 128×128, 64×64, 48×48, 32×32, 24×24, 16×16 (32-bit RGBA) 전체 표준 규격 프레임을 단일 `.ico` 파일에 통합 패키징하여 배포할 것.
+- 또한 16×16 및 32×32의 극소형 영역에서도 심벌이 뭉개지지 않도록, 과도하게 복잡한 세부 묘사를 피하고 굵은 윤곽선(Stroke)과 고대비 기하학적 형태를 기본으로 설계해야 함.
 
 ### 🔤 C++ 트레일링 역슬래시(`\`) 줄바꿈(Line-Splicing) 버그 방지
 - C/C++ 소스 및 헤더의 한 줄 주석(`//`) 끝에는 절대로 단독 역슬래시(`\`)를 두지 말고, `\\` 또는 `(예: C:\\)` 등으로 처리할 것. 전처리기가 다음 줄을 주석으로 삼키는 참사 방지.
